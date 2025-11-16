@@ -1,8 +1,8 @@
 # iut_sd2_rshiny_enedis
-###Logements en Isère - Visualisation Interactive
+### Logements en Isère - Visualisation Interactive
 Ce projet Shiny permet de visualiser les logements situés en Isère 38, France. Les données proviennent de l'API publique de l'ADEME, et l'application affiche une carte interactive avec des informations sur les logements existants et neufs, ainsi qu'une analyse graphique.
-##Fonctionnalités
-#1. Cartographie interactive
+## Fonctionnalités
+# 1. Cartographie interactive
 Affichage des logements sur une carte interactive utilisant leaflet, avec possibilité de zoom et navigation. Les points représentent les logements, et chaque point peut être cliqué pour révéler des informations détaillées.
 #2. Filtrage par étiquettes DPE
 Les logements sont colorés selon leur étiquette de performance énergétique (DPE), allant de A (meilleure performance) à G (plus énergivore), facilitant l'identification visuelle des performances énergétiques sur la carte.
