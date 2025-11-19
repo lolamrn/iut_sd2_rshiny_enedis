@@ -1,0 +1,433 @@
+---
+title: "Analyse statistique des DPE"
+author: "Lola Marion & Quentin Deranque"
+output: html_document
+params:
+  code_insee: "38185"      # Modifier ICI le code insee de la commune étudiée
+  type_bati: "tout"        # Préciser ICI le type de logement étudié "tout", "existants", "neufs"
+---
+
+```{r setup, include=FALSE}
+# Import des libraires nécessaires à la réalisation de ce rapport.
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(ggplot2)
+library(stats)
+library(FactoMineR)
+library(factoextra)
+library(tidyr)
+library(stringr)
+```
+
+```{r import, echo=FALSE, include=TRUE, message=FALSE, warning=FALSE}
+# Liste d'années
+annees <- 2021:as.numeric(format(Sys.Date(), "%Y"))
+
+# --- Fonction API ---
+dpe_commune_annee = function(url, code_insee, annee) {
+
+  all_data = list()
+  page = 1
+  size = 10000
+  execute = FALSE
+
+  while (!execute) {
+    params = list(
+      page = page, size = size,
+      select = paste(
+        "numero_dpe,nom_commune_brut,code_insee_ban,etiquette_dpe,date_reception_dpe,",
+        "conso_5_usages_par_m2_ep,emission_ges_5_usages_par_m2,cout_total_5_usages,",
+        "etiquette_ges,type_batiment,adresse_ban,",
+        "surface_habitable_logement,emission_ges_chauffage",
+        sep=""
+      ),
+      qs = paste0(
+        'code_insee_ban:"', code_insee,
+        '" AND date_reception_dpe:[', annee, '-01-01 TO ', annee, '-12-31]'
+      )
+    )
+
+    url_encoded = httr::modify_url(url, query=params)
+    response <- httr::GET(url_encoded)
+
+    if (response$status_code != 200) break
+
+    content <- jsonlite::fromJSON(rawToChar(response$content), flatten=TRUE)
+    lignes <- content$result
+
+    if (length(lignes)==0) { 
+      execute <- TRUE 
+    } else {
+      all_data[[page]] <- lignes
+      page <- page + 1
+      if (nrow(lignes) < size) execute <- TRUE
+    }
+  }
+
+  if (length(all_data)==0) return(NULL)
+
+  df <- do.call(rbind, all_data)
+
+  needed <- c("emission_ges_5_usages_par_m2","conso_5_usages_par_m2_ep",
+              "surface_habitable_logement","emission_ges_chauffage")
+
+  for (v in needed) if (!v %in% names(df)) df[[v]] <- NA_real_
+
+  df
+}
+
+# --- Fonction multi-années ---
+get_dpe <- function(type, code_insee){
+  url <- if (type=="existant")
+    "https://data.ademe.fr/data-fair/api/v1/datasets/dpe03existant/lines"
+  else
+    "https://data.ademe.fr/data-fair/api/v1/datasets/dpe02neuf/lines"
+
+  big_list <- list()
+
+  for (annee in annees){
+    lignes <- dpe_commune_annee(url, code_insee, annee)
+    if (!is.null(lignes)) big_list[[paste0(annee)]] <- lignes
+  }
+
+  if (length(big_list)==0) return(data.frame())
+  do.call(rbind, big_list)
+}
+
+# --- Chargement ---
+df_existant <- get_dpe("existant", params$code_insee)
+df_neuf     <- get_dpe("neuf",     params$code_insee)
+
+df_all <- dplyr::bind_rows(
+  df_existant %>% mutate(type_logement="Existant"),
+  df_neuf     %>% mutate(type_logement="Neuf")
+)
+
+df <- df_all
+if (params$type_bati == "existants") df <- df_all %>% filter(type_logement=="Existant")
+if (params$type_bati == "neufs")     df <- df_all %>% filter(type_logement=="Neuf")
+
+df$cons <- suppressWarnings(as.numeric(df$conso_5_usages_par_m2_ep))
+df$ges  <- suppressWarnings(as.numeric(df$emission_ges_5_usages_par_m2))
+```
+
+# **Brève présentation de l'étude et de l'origine de ses données**
+
+<p>Cette étude statistique se concentre sur les données des diagnostiques de peroformances énergétiques (DPE) déclarés à l'ADEME sur la commune sélectionnée au moment de la génération du rapport. Ces données proviennent de deux API mises en place par l'ADEME (une concernant les logements existants et une autre concernant les logements neufs). Tous les logements d'une commune ne sont pas présents dans ces bases de données, seuls les logements ayant fait l'objet d'un diagnostique depuis 2021 sont disponibles dans ces API.</p>
+<p>Il est important de garder cette limite à l'esprit tout au long du rapport. Certains biens peuvent être sur-représentés (par exemple : les biens mis en location), et a contrario d'autres peuvent être sous-représentés (les vieux logements).</p>
+<p>Néanmoins, l’échantillon est généralement suffisant pour faire émerger des tendances robustes,
+notamment en matière de consommation énergétique et de distribution des classes DPE/GES.</p>
+
+
+
+# **2. Statistiques générales**
+
+## Nombre total
+
+```{r nb_diag, echo=FALSE, include=TRUE}
+cat("Nombre total de DPE disponibles :", nrow(df))
+```
+
+## Répartition par année
+```{r repart_annees, echo=FALSE, include=TRUE}
+table(substr(df$date_reception_dpe,1,4))
+```
+
+Une forte augmentation des DPE après 2021 peut refléter les conséquences de l’évolution réglementaire.  
+
+Si certaines années sont très peu représentées, il faut garder à l’esprit que les analyses temporelles
+seront moins fiables et doivent être interprétées avec prudence.
+
+
+## Graphique des répartition des étiquettes DPE
+
+```{r plot_dpe, echo=FALSE, include=TRUE}
+# Palette officielle des étiquettes DPE (A → G)
+palette_dpe <- c(
+  "A" = "#009E3B",
+  "B" = "#55B948",
+  "C" = "#A3D977",
+  "D" = "#FFF200",
+  "E" = "#F9B233",
+  "F" = "#EB7223",
+  "G" = "#E30613"
+)
+
+ggplot(df %>% filter(etiquette_dpe %in% LETTERS[1:7]),
+       aes(x = etiquette_dpe, fill = etiquette_dpe)) +
+  geom_bar() +
+  scale_fill_manual(values = palette_dpe) +
+  labs(title="Répartition des étiquettes DPE",
+       x="Étiquette", y="Effectifs") +
+  theme_minimal()
+```
+
+La répartition des lettres A à G donne un aperçu immédiat du niveau général de performance énergétique du parc dans le parc des logements.
+
+Une proportion élevée de classes D–E indique un parc plutôt énergivore, ce qui est classique pour les logements anciens (la majorité des étiquettes DPE provient de logements anciens).
+La part importante de F–G révèle des passoires énergétiques. Ces logements sont ceux visés en priorité par les politiques publiques (pression sur la possibilité de location et aides pour la rénovation).
+Dans le cas d'une présence significative d'étiquettes A et B nous pouvons supposer qu'il y a de nombreuses constructions récentes ou d'importantes politiques de  (ces deux facteurs peuvent se confondre) mises en place dans cette aire géographique.
+
+L’analyse de cette distribution permet d’anticiper les besoins potentiels en rénovation énergétique à l’échelle locale.
+
+
+## A propos des étiquettes GES :
+
+```{r plot_ges, echo=FALSE, include=TRUE}
+
+# Palette GES officielle ADEME (violet)
+palette_ges <- c(
+  "A" = "#E5D4F4",
+  "B" = "#D4B8F2",
+  "C" = "#C39BF0",
+  "D" = "#B17FEE",
+  "E" = "#A062EC",
+  "F" = "#8F46EA",
+  "G" = "#7D29E8"
+)
+
+ggplot(df %>% filter(etiquette_ges %in% LETTERS[1:7]),
+       aes(x = etiquette_ges, fill = etiquette_ges)) +
+  geom_bar() +
+  scale_fill_manual(values = palette_ges) +
+  labs(title="Répartition des étiquettes GES",
+       x="Étiquette", y="Effectifs") +
+  theme_minimal()
+```
+
+Les étiquettes GES complètent les résultats du DPE en se focalisant sur l’impact carbone.
+
+Une dominance des classes E–F signale un recours probable à des systèmes de chauffage carbonés (fioul, gaz).A l’inverse, une bonne partie de C ou mieux indique souvent la présence d’électricité, de l'usage du bois ou de la présence de réseaux urbains faiblement carbonés.
+
+Comparer DPE et GES permet également d’identifier des situations paradoxales : </br>
+- Un logement peu énergivore mais fortement émetteur (ex : chauffage gaz),</br>
+- Un logement très énergivore mais peu émetteur (ex : chauffage électrique).
+
+
+## A propos de la consommation
+
+
+```{r hist_conso, echo=FALSE, include=TRUE}
+summary(df$cons)
+
+ggplot(df, aes(x=cons)) +
+  geom_histogram(fill="orange", bins=30) +
+  labs(title="Distribution de la consommation énergétique",
+       x="kWh/m²/an")
+```
+
+La forme de l’histogramme donne des indications importantes : </br>
+
+- Une distribution étalée vers la droite (queue longue) est typique : certains logements
+  consomment énormément par rapport au reste du parc.</br>
+- La médiane (souvent plus robuste que la moyenne) caractérise mieux la “tendance centrale”.</br>
+
+Points d'attentions :</br>
+- Symétrie ou asymétrie de la distribution.</br>
+- La présence de valeurs extrêmes peut être un signe de passoires énergétiques.</br>
+- Une réparition comportant plusieurs pics nous apprend qu'il y a des typologies différentes de logements.
+
+Ce diagnostic permet de comprendre si la commune possède un parc performant.
+
+
+---
+
+# **3. Analyse comparative**
+
+## Comparaison existant vs neuf
+
+```{r comparaison, echo=FALSE, include=TRUE}
+df2 <- df
+if (params$type_bati == "tout"){
+  
+  p1 <- ggplot(df2, aes(x=type_logement, y=cons, fill=type_logement)) +
+    geom_boxplot() +
+    labs(title="Comparaison des consommations", y="kWh/m²/an", x="")
+  print(p1)
+}
+```
+
+Les boxplots permettent de comparer visuellement la répartition des performances énergétiques
+des logements existants et des logements neufs.</br>
+
+Points à observer :</br>
+- La position des médianes :</br>  
+  → si la médiane des logements neufs est nettement plus basse, cela confirme des performances supérieures.</br>
+
+- L'étendue interquartile :</br>
+  → un un écart interquartile plus petit chez les logements neufs indique une plus grande homogénéité
+     (compatible avec des normes de construction plus standardisées).</br>
+
+- La présence éventuelle d'outliers dans l’existant :</br>  
+  → souvent signe d’isolation défaillante ou de systèmes de chauffage anciens.</br>
+
+Absolument tous les résultats devraient aller dans le sens d’une meilleure performance des logements neufs, conformément aux réglementations thermiques (RT2012, RE2020).
+
+
+
+```{r tests_chi, echo=FALSE, include=TRUE, comment=""}
+if (length(unique(df2$type_logement)) == 2) {
+
+    cat("Test de Wilcoxon pour la consommation :\n")
+    print(wilcox.test(cons ~ type_logement, data=df2))
+
+    tab_dpe <- table(df2$type_logement, df2$etiquette_dpe)
+
+    cat("\nTest du χ² sur les étiquettes DPE :\n")
+    print(chisq.test(tab_dpe))
+
+  } else {
+    cat("Tests statistiques non effectués : un seul type de logement présent dans les données.\n")
+  }
+```
+
+Le test de Wilcoxon (ou de Student si la normalité est vérifiée) permet de valider statistiquement
+si les deux groupes (Existant vs Neuf) présentent des consommations significativement différentes.
+
+- Si la **p-value < 0.05** alors une différence statistiquement significative de la consommation est observée entre ces deux groupes.</br>
+- Si la **p-value > 0.05** alors aucune différence n'est démontrée (c'est un cas rare mais possible si la commune a peu de logements neufs)
+
+Quant au test du χ² sur les étiquettes DPE :
+- Si une **p-value faible** est observée alors les profils DPE diffèrent réellement entre les logements neufs et existants.</br>
+- Si la **p-value est élevée** alors les distributions sont comparables.
+
+Ce second test est essentiel pour valider formellement ce que montre le graphique.
+
+
+---
+
+## Analyse segment unique
+
+```{r segment, echo=FALSE, include=TRUE}
+if (params$type_bati != "tout"){
+
+  ggplot(df, aes(x=cons)) +
+    geom_histogram(fill="skyblue", bins=30) +
+    labs(title="Distribution de la consommation (segment)", x="kWh/m²/an")
+
+  summary(df$cons)
+
+  cat("Corrélation consommation ↔ GES :\n")
+  print(cor(df$cons, df$ges, use="complete.obs"))
+
+  mod <- lm(ges ~ cons, data=df)
+  print(summary(mod))
+}
+```
+
+Analyse dans le cas où un segment unique (neuf ou existant) a été choisi lors de la génération du rapport.
+
+Dans ce cas, l’analyse vise à caractériser un seul segment du parc :
+
+- Si l’on analyse **les existants** : </br> 
+  → On cherche à comprendre la diversité des performances et à identifier les besoins de rénovation.</br>
+
+- Si l’on analyse **les neufs** : </br> 
+  → On vérifie si les logements récents respectent les normes attendues (forte concentration autour de faibles consommations).</br>
+
+La distribution permet généralement d’observer si le segment est homogène ou s’il existe plusieurs sous-typologies.
+
+#### Interprétation du modèle linéaire
+
+La régression `GES ~ consommation` permet d’observer si un logement très énergivore
+est également fortement émetteur de GES.</br>
+
+- Un **coefficient de pente positif et significatif** indique un lien clair :
+  plus un logement consomme, plus il émet du CO₂.</br>
+
+- Si la pente est faible ou non significative, cela indique que des facteurs
+  externes influencent les émissions (type de chauffage, énergie utilisée).</br>
+
+Le R² quantifie la capacité du modèle à expliquer les émissions :</br>
+- **R² élevé (> 0.5)** → relation forte, cohérente avec un parc homogène.  
+- **R² faible** → parc hétérogène, chauffage très varié.
+
+
+---
+
+# **4. Analyse en composante principale (ACP)**
+
+```{r acp, echo=FALSE, include=TRUE, message=FALSE, warning=FALSE}
+
+df_numeric <- df %>%
+  mutate(
+    cons = as.numeric(conso_5_usages_par_m2_ep),
+    ges  = as.numeric(emission_ges_5_usages_par_m2),
+    surf = as.numeric(surface_habitable_logement)
+  ) %>%
+  select(cons, ges, surf) %>%
+  drop_na()
+
+# Échantillonnage afin d'éviter un calcul trop lourd pour l'ordi
+if (nrow(df_numeric) > 2000) {
+  set.seed(123)
+  df_numeric <- df_numeric[sample(nrow(df_numeric), 2000), ]
+}
+
+if (nrow(df_numeric) > 20) {
+
+  acp <- FactoMineR::PCA(df_numeric, graph = FALSE)
+
+  #Graphique des individus
+  factoextra::fviz_pca_ind(
+    acp,
+    label = "none",
+    pointsize = 0.5,
+    alpha.ind = 0.5
+  )
+
+  factoextra::fviz_pca_var(
+    acp,
+    repel = TRUE,
+    col.var = "steelblue"
+  )
+}
+```
+
+L’Analyse en Composantes Principales (ACP) permet de résumer les relations entre les trois variables
+quantitatives utilisées dans cette étude : **consommation énergétique**, **émissions de GES** et
+**surface habitable**.
+
+#### Axe 1 (Dim1)
+L’axe 1 explique environ **44–45% de l’inertie totale**.  
+Il oppose :</br>
+
+- la **consommation énergétique** (*cons*) est fortement alignée avec cet axe,</br>
+- les logements à **faible consommation** (valeurs négatives de l’axe).</br>
+
+Cet axe représente donc essentiellement un **gradient de performance énergétique** :</br>  
+plus un logement consomme, plus il se situe vers la droite.</br>
+
+#### Axe 2 (Dim2)
+L’axe 2 explique environ **35% de l’inertie**. </br> 
+Il est surtout influencé par la variable **surface habitable** (*surf*) qui est orientée vers le haut du graphique.</br>
+
+Cet axe décrit donc principalement un **gradient de taille des logements**</br>
+
+#### Relations entre les variables
+- Les variables **cons** et **ges** sont orientées dans des directions proches, ce qui confirme
+  une **corrélation positive** entre consommation énergétique et émissions de GES.  
+  → plus un logement consomme, plus il émet de CO₂.</br>
+
+- La variable **surf** pointe dans une direction différente :</br>  
+  → les grandes surfaces ne sont pas corrélées à la consommation **par m²**,  
+     ce qui est logique, car la consommation est normalisée à la surface.</br>
+
+- L’angle plutôt ouvert entre *surf* et les deux autres variables confirme que  
+  la surface habitable est une dimension indépendante de la performance énergétique au m².</br>
+
+#### Lecture globale
+- L’ACP montre que la **performance énergétique** (cons, ges) forme une dimension cohérente et fortement corrélée.</br>  
+- La **surface** constitue une seconde dimension indépendante.</br>
+- Les logements se répartissent donc principalement selon deux critères :</br>
+  1. **Performance énergétique**,  
+  2. **Taille du logement**.
+
+Ces résultats sont cohérents avec ce que l’on attend d’un parc de logements : la surface habitable n’influence pas directement la performance énergétique rapportée au m².
+
+
+
+
